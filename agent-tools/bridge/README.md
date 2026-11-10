@@ -6,7 +6,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../LICENSE)
 
 Local single-binary daemon that connects Threads owner-scoped events to local
-agent CLIs (Codex, Claude Code, and Pi headless). Release archives contain the
+agent CLIs (Codex, Claude Code, and Pi headless) or T3 Code through its native MCP API. Release archives contain the
 canonical agent-facing `threads` CLI built from the same public source commit.
 
 ## v0 shape
@@ -48,6 +48,77 @@ go build -o bin/threads-agent-bridge ./cmd/threads-agent-bridge
 
 The `threads` executable is implemented in [`../cli`](../cli). See its build
 instructions above.
+
+## Connect T3 Code
+
+Requires Go 1.26 or newer, the T3 CLI on `PATH`, and a running, signed-in T3 server.
+The native runner uses authenticated Streamable HTTP MCP, tested against T3 0.1.7.
+It does not invoke an agent through the `t3` CLI.
+
+From this directory, authorize the bridge and list your available T3 projects:
+
+```bash
+go run ./cmd/threads-agent-bridge -t3-setup -t3-check \
+  -t3-url http://127.0.0.1:3773 \
+  -t3-credentials ../../.local/t3-credentials.json
+```
+
+Use your T3 server port if it differs from `3773` (`T3CODE_PORT` in T3-managed terminals).
+The setup command creates a five-minute pairing credential through `t3 auth pairing create`,
+registers an OAuth client, and exchanges a PKCE authorization code. It never prints tokens.
+OAuth credentials stay in the specified local file with mode `0600`; the bridge refreshes them before expiry.
+The pairing grant permits orchestration, settings, and source-control operations.
+Agent permissions are configured separately with `runtime_mode`.
+
+Copy and edit the T3 example:
+
+```bash
+cp config.t3.example.json config.local.json
+```
+
+Set `threads.user_id` to the bot's user ID and `match.channel_ids` to channels that should route to T3.
+Set `runner.t3.project_id` from the project list.
+Choose an installed provider and model in `model_selection` (`instanceId`, `model`, and optional `options`).
+Set `THREADS_T3_TOKEN` in your shell or service environment to the bot token, then run:
+
+```bash
+go run ./cmd/threads-agent-bridge -config config.local.json
+```
+
+Paths in the config are relative to the process working directory.
+The example assumes this `agent-tools/bridge` directory, also used by the root `npm run bridge` helper.
+Use absolute paths for a system service.
+
+`runtime_mode` defaults to `approval-required`. T3 also supports `auto-accept-edits`, `auto`, and `full-access`.
+Approve pending requests in the T3 UI. The bridge posts a notice when T3 is waiting for input.
+Threads relays activity but does not provide T3 approval controls.
+`interaction_mode` accepts `default` or `plan`.
+The runner starts conversations in the selected project's root checkout.
+The T3 agent receives the user message and final-output instructions, without Threads credentials or promises of local `THREADS_*` variables.
+
+The bridge stores the T3 thread ID as soon as T3 accepts a launch, including when that run later fails or is stopped.
+Turns for the same scope, channel, and Threads root run serially; different roots can run concurrently.
+A reply checks that its saved T3 thread belongs to the configured project and has no active or queued work.
+If you use that conversation directly in T3, wait for it to finish before replying through Threads.
+The runner reads actual T3 timeline tool items and posts their start and completion as Threads tool rows.
+It waits for delegated work to settle, then posts the last assistant message from the exact result run acknowledged by T3, with full text pagination.
+Stop interrupts the accepted remote run; a failed interrupt reports an error.
+It does not stop delegated children after their parent run has completed. Stop those children in T3.
+Each turn and interrupt uses a stable request ID derived from the triggering event.
+
+The bridge retains its existing event-delivery limits: events are marked processed before inference, and cursors can advance before final delivery.
+A bridge crash, ambiguous dispatch response, or failed final post is not automatically replayed.
+A crash after remote acceptance but before saving its acknowledgement can leave an unmapped T3 run.
+Normal SIGINT or SIGTERM shutdown interrupts active T3 runs and waits up to 45 seconds for bridge workers to finish.
+Set a service manager shutdown timeout above 45 seconds.
+Restarting after a crash does not stop or recover runs that were active when the bridge exited unexpectedly.
+Use one bridge process per SQLite state file and scope; the per-root queue is local to that process.
+This integration does not add a durable job queue or exactly-once message delivery.
+
+For device access over Tailscale, serve the Threads web UI through Tailscale HTTPS.
+Keep the bridge's Threads and T3 URLs on loopback when they run on the same host.
+For the separate Vite development server, allow the tailnet hostname with `__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS` and configure the API's `APP_ORIGIN` to that HTTPS origin.
+Use a private bot token and change seeded login passwords before exposing a seeded local instance.
 
 ## Development
 

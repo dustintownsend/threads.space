@@ -4,7 +4,7 @@
   "version": "0.0.1",
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev --config wrangler.toml --port 8788",
+    "dev": "wrangler dev --local --config wrangler.toml --port 8788",
     "test": "npm run test:service && vitest run",
     "test:service": "vitest run --config vitest.service.config.ts",
     "test:smoke": "vitest run --config vitest.smoke.config.ts",

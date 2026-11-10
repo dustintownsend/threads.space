@@ -22,6 +22,7 @@ type Input struct {
 	RunnerSessionID     string
 	NewSession          bool
 	GenerateThreadTitle bool
+	OnSessionAccepted   func(context.Context, string) error
 	OnToolEvent         ToolEventHandler
 	OnLimitEvent        LimitEventHandler
 }
@@ -72,6 +73,9 @@ type Runner interface {
 type LocalRunner struct{}
 
 func (LocalRunner) Run(ctx context.Context, scope config.Scope, input Input) (Output, error) {
+	if scope.Runner.Type == "t3" {
+		return runT3(ctx, scope, input)
+	}
 	adapter := adapterFor(scope.Runner.Type)
 	invocation := adapter.BuildInvocation(scope, input)
 	if invocation.UnsupportedMessage != "" {

@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -54,9 +55,14 @@ type Daemon struct {
 
 	activeMu sync.Mutex
 	active   map[string]context.CancelFunc
+	rootsMu  sync.Mutex
+	roots    map[string]*rootGate
+	workers  sync.WaitGroup
 }
 
 func (d *Daemon) Run(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	if d.Runner == nil {
 		d.Runner = runner.LocalRunner{}
 	}
@@ -67,15 +73,26 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.Logger = slog.Default()
 	}
 	errc := make(chan error, len(d.Config.Scopes))
+	var scopes sync.WaitGroup
 	for _, scope := range d.Config.Scopes {
 		scope := scope
-		go func() { errc <- d.runScope(ctx, scope) }()
+		scopes.Add(1)
+		go func() { defer scopes.Done(); errc <- d.runScope(ctx, scope) }()
 	}
+	var err error
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
-	case err := <-errc:
+		err = ctx.Err()
+	case err = <-errc:
+	}
+	cancel()
+	drained := make(chan struct{})
+	go func() { scopes.Wait(); d.workers.Wait(); close(drained) }()
+	select {
+	case <-drained:
 		return err
+	case <-time.After(45 * time.Second):
+		return errors.Join(err, errors.New("bridge shutdown timed out while draining active runs"))
 	}
 }
 
@@ -126,7 +143,9 @@ func (d *Daemon) consumeEvents(ctx context.Context, scope config.Scope, eventsCl
 				d.HandleProcessKill(event)
 				continue
 			}
+			d.workers.Add(1)
 			go func(event threads.Event) {
+				defer d.workers.Done()
 				if err := d.HandleEvent(ctx, scope, sender, processes, event); err != nil {
 					if d.Logger != nil {
 						d.Logger.Error("handle event", "scope", scope.ID, "error", err)
@@ -174,6 +193,11 @@ func (d *Daemon) HandleEvent(ctx context.Context, scope config.Scope, sender Sen
 	if messageEvent && scope.Threads.UserID != "" && event.Message.SenderID == scope.Threads.UserID {
 		return nil
 	}
+	release, err := d.lockRoot(ctx, scope.ID+"\x00"+event.ChannelID+"\x00"+threadID)
+	if err != nil {
+		return err
+	}
+	defer release()
 	eventID := event.ID
 	if eventID == "" {
 		eventID = event.Cursor
@@ -203,23 +227,29 @@ func (d *Daemon) HandleEvent(ctx context.Context, scope config.Scope, sender Sen
 		}
 	}
 	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	d.trackProcess(processID, cancel)
 	defer d.untrackProcess(processID)
 
-	out, err := d.Runner.Run(runCtx, scope, runner.Input{ScopeID: scope.ID, Event: event, ThreadID: threadID, RunnerSessionID: runnerSessionID, NewSession: runnerSessionID == "", GenerateThreadTitle: generateThreadTitle, OnToolEvent: d.toolEventHandler(scope, sender, processes, processID, event, threadID), OnLimitEvent: d.limitEventHandler(scope, sender, processes, processID, event, threadID)})
+	out, err := d.Runner.Run(runCtx, scope, runner.Input{ScopeID: scope.ID, Event: event, ThreadID: threadID, RunnerSessionID: runnerSessionID, NewSession: runnerSessionID == "", GenerateThreadTitle: generateThreadTitle, OnSessionAccepted: func(acceptedCtx context.Context, sessionID string) error {
+		return d.Store.SaveRunnerSessionID(context.WithoutCancel(acceptedCtx), scope.ID, event.ChannelID, threadID, sessionID)
+	}, OnToolEvent: d.toolEventHandler(scope, sender, processes, processID, event, threadID), OnLimitEvent: d.limitEventHandler(scope, sender, processes, processID, event, threadID)})
 	if err != nil {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cleanupCancel()
 		status := "error"
-		if runCtx.Err() != nil || ctx.Err() != nil {
+		var remoteCancellation *runner.RemoteCancellationError
+		if (runCtx.Err() != nil || ctx.Err() != nil) && !errors.As(err, &remoteCancellation) {
 			status = "killed"
 		}
 		if processes != nil {
-			_ = processes.UpdateProcess(context.WithoutCancel(ctx), processID, threads.UpdateProcessRequest{Status: status})
-			_ = processes.UpdateMessageProcessStatus(context.WithoutCancel(ctx), event.Message.ID, threads.UpdateMessageProcessStatusRequest{ProcessID: processID, Status: status, ErrorText: err.Error()})
+			_ = processes.UpdateProcess(cleanupCtx, processID, threads.UpdateProcessRequest{Status: status})
+			_ = processes.UpdateMessageProcessStatus(cleanupCtx, event.Message.ID, threads.UpdateMessageProcessStatusRequest{ProcessID: processID, Status: status, ErrorText: err.Error()})
 		}
 		if status == "killed" {
 			return nil
 		}
-		if sendErr := sender.SendMessage(context.WithoutCancel(ctx), event.ChannelID, threads.SendMessageRequest{Content: runnerErrorMessage(err), ThreadID: threadID, MessageType: "progress", Metadata: map[string]any{"source": "threads-agent-bridge", "kind": "error", "severity": "error", "scope_id": scope.ID, "process_id": processID}}); sendErr != nil {
+		if sendErr := sender.SendMessage(cleanupCtx, event.ChannelID, threads.SendMessageRequest{Content: runnerErrorMessage(err), ThreadID: threadID, MessageType: "progress", Metadata: map[string]any{"source": "threads-agent-bridge", "kind": "error", "severity": "error", "scope_id": scope.ID, "process_id": processID}}); sendErr != nil {
 			if d.Logger != nil {
 				d.Logger.Warn("send runner error", "scope", scope.ID, "error", sendErr)
 			}
@@ -586,4 +616,38 @@ func SleepBackoff(attempt int) time.Duration {
 		attempt = 6
 	}
 	return time.Duration(1<<uint(attempt-1)) * time.Second
+}
+
+type rootGate struct {
+	token chan struct{}
+	users int
+}
+
+func (d *Daemon) lockRoot(ctx context.Context, key string) (func(), error) {
+	d.rootsMu.Lock()
+	if d.roots == nil {
+		d.roots = map[string]*rootGate{}
+	}
+	gate := d.roots[key]
+	if gate == nil {
+		gate = &rootGate{token: make(chan struct{}, 1)}
+		d.roots[key] = gate
+	}
+	gate.users++
+	d.rootsMu.Unlock()
+	releaseRef := func() {
+		d.rootsMu.Lock()
+		gate.users--
+		if gate.users == 0 {
+			delete(d.roots, key)
+		}
+		d.rootsMu.Unlock()
+	}
+	select {
+	case gate.token <- struct{}{}:
+		return func() { <-gate.token; releaseRef() }, nil
+	case <-ctx.Done():
+		releaseRef()
+		return nil, ctx.Err()
+	}
 }

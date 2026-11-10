@@ -1,5 +1,12 @@
 import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
+import { inject } from 'vitest';
+
+declare module 'vitest' {
+  export interface ProvidedContext {
+    wranglerStatePath: string;
+  }
+}
 
 export const BASE_URL = 'http://localhost:8799';
 
@@ -18,7 +25,9 @@ const ADMIN_PASSWORD = 'testpass123';
 // `wrangler d1 execute --local` targets (see setup.ts, which applies migrations
 // the same way). execFileSync avoids the shell so SQL quoting is safe.
 function d1Execute(sql: string, json = false): string {
-  const args = ['wrangler', 'd1', 'execute', 'threads', '--local', '--config', 'wrangler.toml'];
+  const statePath = inject('wranglerStatePath');
+  if (!statePath) throw new Error('Missing isolated Wrangler test state from global setup');
+  const args = ['wrangler', 'd1', 'execute', 'threads', '--local', '--config', 'wrangler.toml', '--persist-to', statePath];
   if (json) args.push('--json');
   args.push('--command', sql);
   try {

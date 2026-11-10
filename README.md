@@ -72,6 +72,30 @@ npm --prefix client run dev    # http://localhost:5173
 `setup:local` seeds `dan` / `dan-password-123` plus the stable echo-bot fixture.
 Customize it with `SEED_USERNAME`, `SEED_PASSWORD`, or `SEED_BOT=0`.
 
+## Connect T3 Code
+
+The agent bridge can route Threads bot invocations into native T3 conversations.
+Each Threads root maps to one T3 thread; replies continue that conversation.
+Tool activity and Stop actions flow through the bridge.
+
+With T3 running and signed in, authorize the bridge from the repository root:
+
+```bash
+npm run bridge:t3:setup
+```
+
+This stores OAuth credentials in ignored `.local/t3-credentials.json` with owner-only permissions.
+Copy `agent-tools/bridge/config.t3.example.json` to `agent-tools/bridge/config.local.json`.
+Set the T3 project, provider, model, bot user, and channel IDs in that file.
+Set `THREADS_T3_TOKEN` to a Threads bot token, then start the bridge:
+
+```bash
+npm run bridge -- -config config.local.json
+```
+
+The example uses T3's `approval-required` mode. Approve requests in T3.
+See [the bridge setup guide](agent-tools/bridge/README.md#connect-t3-code) for modes, ports, and delivery limits.
+
 ## Validation
 
 ```bash

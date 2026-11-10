@@ -30,6 +30,7 @@ func (f *fakeRunner) Run(ctx context.Context, scope config.Scope, in runner.Inpu
 }
 
 type fakeSender struct {
+	afterSend        func()
 	sent             []threads.SendMessageRequest
 	titleMessageIDs  []string
 	titles           []threads.SetThreadTitleRequest
@@ -45,6 +46,9 @@ type fakeSender struct {
 
 func (f *fakeSender) SendMessage(ctx context.Context, channelID string, req threads.SendMessageRequest) error {
 	f.sent = append(f.sent, req)
+	if f.afterSend != nil {
+		f.afterSend()
+	}
 	return nil
 }
 
@@ -237,16 +241,12 @@ func TestRunScopeReconnectsWhenEventStreamCloses(t *testing.T) {
 	}
 	defer st.Close()
 	source := &reconnectingEventSource{}
-	sender := &fakeSender{}
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sender := &fakeSender{afterSend: cancel}
 	d := Daemon{
-		Store: st,
-		Runner: callbackRunner{onRun: func() {
-			go func() {
-				time.Sleep(10 * time.Millisecond)
-				cancel()
-			}()
-		}},
+		Store:  st,
+		Runner: callbackRunner{},
 		Clients: func(scope config.Scope, token string) (EventSource, Sender, ProcessClient) {
 			return source, sender, nil
 		},
@@ -621,5 +621,134 @@ func TestHandleEventMapsTopLevelMessageToThreadSessionAndRepliesResume(t *testin
 	}
 	if s.sent[0].ThreadID != "m-root" || s.sent[1].ThreadID != "m-root" {
 		t.Fatalf("bad reply targets: %+v", s.sent)
+	}
+}
+
+type acceptedSessionRunner struct {
+	accepted chan struct{}
+	finish   chan struct{}
+	resumed  chan string
+}
+
+func (r acceptedSessionRunner) Run(ctx context.Context, scope config.Scope, in runner.Input) (runner.Output, error) {
+	if in.RunnerSessionID != "" {
+		r.resumed <- in.RunnerSessionID
+		return runner.Output{Text: "continued", RunnerSessionID: in.RunnerSessionID}, nil
+	}
+	if err := in.OnSessionAccepted(ctx, "t3-thread"); err != nil {
+		return runner.Output{}, err
+	}
+	close(r.accepted)
+	<-r.finish
+	return runner.Output{}, errors.New("run failed after remote acceptance")
+}
+
+func TestRootTurnsSerializeAndKeepAcceptedSessionAfterFailure(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	r := acceptedSessionRunner{accepted: make(chan struct{}), finish: make(chan struct{}), resumed: make(chan string, 1)}
+	d := Daemon{Store: st, Runner: r}
+	s := &fakeSender{}
+	scope := matchAllScope("scope")
+	event := threads.Event{ID: "first", Type: "message.created", ChannelID: "channel", ThreadID: "root", Message: threads.Message{ID: "root", Content: "first"}}
+	first := make(chan error, 1)
+	go func() { first <- d.HandleEvent(context.Background(), scope, s, nil, event) }()
+	<-r.accepted
+	session, err := st.RunnerSessionID(context.Background(), "scope", "channel", "root")
+	if err != nil || session != "t3-thread" {
+		t.Fatalf("acceptance not persisted before completion: %s %v", session, err)
+	}
+	reply := event
+	reply.ID = "second"
+	reply.Message.ID = "reply"
+	reply.Message.Content = "second"
+	second := make(chan error, 1)
+	go func() { second <- d.HandleEvent(context.Background(), scope, s, nil, reply) }()
+	deadline := time.After(time.Second)
+	for {
+		d.rootsMu.Lock()
+		gate := d.roots["scope\x00channel\x00root"]
+		waiting := gate != nil && gate.users == 2
+		d.rootsMu.Unlock()
+		if waiting {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("second turn never waited for the first")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	select {
+	case <-r.resumed:
+		t.Fatal("second turn ran before first finished")
+	default:
+	}
+	close(r.finish)
+	if err := <-first; err == nil {
+		t.Fatal("first failure was hidden")
+	}
+	if err := <-second; err != nil {
+		t.Fatal(err)
+	}
+	if resumed := <-r.resumed; resumed != "t3-thread" {
+		t.Fatalf("resumed %q", resumed)
+	}
+}
+
+type singleEventSource struct{}
+
+func (singleEventSource) Events(ctx context.Context, since string) (<-chan threads.Event, <-chan error) {
+	events := make(chan threads.Event, 1)
+	events <- threads.Event{ID: "event", Type: "message.created", ChannelID: "channel", Message: threads.Message{ID: "root", Content: "hello"}}
+	return events, make(chan error)
+}
+
+type shutdownRunner struct{ started, cancelling, release chan struct{} }
+
+func (r shutdownRunner) Run(ctx context.Context, scope config.Scope, input runner.Input) (runner.Output, error) {
+	close(r.started)
+	<-ctx.Done()
+	close(r.cancelling)
+	<-r.release
+	return runner.Output{}, ctx.Err()
+}
+
+func TestRunDrainsActiveRunnerBeforeReturningOnShutdown(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	r := shutdownRunner{started: make(chan struct{}), cancelling: make(chan struct{}), release: make(chan struct{})}
+	scope := matchAllScope("scope")
+	scope.Threads.Token = "test-token"
+	d := Daemon{Store: st, Runner: r, Config: config.Config{Scopes: []config.Scope{scope}}, Clients: func(config.Scope, string) (EventSource, Sender, ProcessClient) {
+		return singleEventSource{}, &fakeSender{}, nil
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- d.Run(ctx) }()
+	<-r.started
+	cancel()
+	<-r.cancelling
+	select {
+	case err := <-result:
+		t.Fatalf("daemon returned before remote cleanup: %v", err)
+	default:
+	}
+	close(r.release)
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("shutdown error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("daemon did not finish after runner drained")
 	}
 }
