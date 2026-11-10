@@ -1,0 +1,34 @@
+{
+  "database_path": "../../.local/t3-bridge.db",
+  "scopes": [
+    {
+      "id": "t3",
+      "threads": {
+        "base_url": "http://localhost:8788/api",
+        "token_env": "THREADS_T3_TOKEN",
+        "user_id": "REPLACE_WITH_BOT_USER_ID"
+      },
+      "match": {
+        "channel_ids": ["REPLACE_WITH_CHANNEL_ID"],
+        "thread_ids": ["*"]
+      },
+      "runner": {
+        "type": "t3",
+        "structured": true,
+        "auto_title": true,
+        "t3": {
+          "base_url": "http://127.0.0.1:3773",
+          "credentials_file": "../../.local/t3-credentials.json",
+          "project_id": "REPLACE_WITH_T3_PROJECT_ID",
+          "model_selection": {
+            "instanceId": "codex",
+            "model": "gpt-6.1-sol",
+            "options": {"reasoningEffort": "low"}
+          },
+          "runtime_mode": "approval-required",
+          "interaction_mode": "default"
+        }
+      }
+    }
+  ]
+}

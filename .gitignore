@@ -28,3 +28,11 @@ api/.venv-openapi/
 # Project-local Codex MCP credentials (may contain a bearer token)
 .codex/config.toml
 examples/agent-containers/
+
+# Local Threads/T3 bridge configuration, credentials, and SQLite state
+.local/
+agent-tools/bridge/config.json
+agent-tools/bridge/config.local.json
+*.db
+*.db-shm
+*.db-wal

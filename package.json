@@ -11,6 +11,8 @@
   ],
   "scripts": {
     "install:all": "npm ci",
+    "bridge": "cd agent-tools/bridge && go run ./cmd/threads-agent-bridge",
+    "bridge:t3:setup": "npm run bridge -- -t3-setup -t3-check -t3-credentials ../../.local/t3-credentials.json",
     "dev:api": "npm --prefix api run dev",
     "dev:client": "npm --prefix client run dev",
     "check": "npm --prefix client run check",

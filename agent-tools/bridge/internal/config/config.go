@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+
+	"github.com/danielcorin/threads.space/agent-tools/bridge/internal/t3"
 )
 
 type Config struct {
@@ -33,7 +35,23 @@ type MatchConfig struct {
 	ThreadIDs  []string `json:"thread_ids"`
 }
 
+type T3Config struct {
+	BaseURL         string         `json:"base_url"`
+	CredentialsFile string         `json:"credentials_file"`
+	ProjectID       string         `json:"project_id"`
+	ModelSelection  ModelSelection `json:"model_selection"`
+	RuntimeMode     string         `json:"runtime_mode"`
+	InteractionMode string         `json:"interaction_mode"`
+}
+
+type ModelSelection struct {
+	InstanceID string         `json:"instanceId"`
+	Model      string         `json:"model"`
+	Options    map[string]any `json:"options,omitempty"`
+}
+
 type RunnerConfig struct {
+	T3         T3Config `json:"t3"`
 	Type       string   `json:"type"`
 	Command    string   `json:"command"`
 	Args       []string `json:"args"`
@@ -78,6 +96,30 @@ func Load(path string) (Config, error) {
 			return Config{}, fmt.Errorf("scope %q runner.auto_title requires runner.structured", cfg.Scopes[i].ID)
 		}
 		switch cfg.Scopes[i].Runner.Type {
+		case "t3":
+			t := &cfg.Scopes[i].Runner.T3
+			origin, err := t3.ValidateOrigin(t.BaseURL)
+			if err != nil {
+				return Config{}, err
+			}
+			t.BaseURL = origin
+			if t.CredentialsFile == "" || t.ProjectID == "" || t.ModelSelection.InstanceID == "" || t.ModelSelection.Model == "" {
+				return Config{}, fmt.Errorf("scope %q T3 requires credentials_file, project_id and model_selection (instanceId/model)", cfg.Scopes[i].ID)
+			}
+			if t.RuntimeMode == "" {
+				t.RuntimeMode = "approval-required"
+			}
+			if t.InteractionMode == "" {
+				t.InteractionMode = "default"
+			}
+			switch t.RuntimeMode {
+			case "approval-required", "auto-accept-edits", "auto", "full-access":
+			default:
+				return Config{}, fmt.Errorf("invalid T3 runtime_mode %q", t.RuntimeMode)
+			}
+			if t.InteractionMode != "default" && t.InteractionMode != "plan" {
+				return Config{}, fmt.Errorf("invalid T3 interaction_mode %q", t.InteractionMode)
+			}
 		case "claude-code":
 			if cfg.Scopes[i].Runner.Command == "" {
 				cfg.Scopes[i].Runner.Command = "claude"

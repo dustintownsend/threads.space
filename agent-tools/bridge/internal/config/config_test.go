@@ -113,3 +113,26 @@ func TestLoadAutoTitleWithStructuredOutput(t *testing.T) {
 		t.Fatalf("auto_title not loaded: %+v", cfg.Scopes[0].Runner)
 	}
 }
+
+func TestLoadT3RequiresExplicitTargetAndDefaultsToApprovals(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	data := `{"scopes":[{"id":"t3","threads":{"base_url":"http://localhost/api","token_env":"TOKEN"},"runner":{"type":"t3","t3":{"base_url":"http://127.0.0.1:3773","credentials_file":".local/token.json","project_id":"project","model_selection":{"instanceId":"codex","model":"gpt-6.1-sol"}}}}]}`
+	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := cfg.Scopes[0].Runner.T3
+	if target.RuntimeMode != "approval-required" || target.InteractionMode != "default" {
+		t.Fatalf("unsafe defaults: %+v", target)
+	}
+	data = `{"scopes":[{"id":"t3","threads":{"base_url":"http://localhost/api","token_env":"TOKEN"},"runner":{"type":"t3","t3":{"base_url":"http://127.0.0.1:3773"}}}]}`
+	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("accepted implicit T3 target/model")
+	}
+}

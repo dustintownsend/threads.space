@@ -1,12 +1,15 @@
 import { spawn, execSync, execFileSync, type ChildProcess } from 'child_process';
 import { resolve } from 'path';
-import { rmSync } from 'fs';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import type { TestProject } from 'vitest/node';
 import { adminUpsertSql } from '../../scripts/seed-lib.mjs';
 
 const PORT = 8799;
 const PROJECT_DIR = resolve(__dirname, '../..');
 const SHUTDOWN_TIMEOUT_MS = 5000;
 let wranglerProcess: ChildProcess | undefined;
+let statePath: string | undefined;
 
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -56,7 +59,10 @@ async function waitForServer(url: string, timeoutMs = 30000): Promise<void> {
   throw new Error(`Server did not start within ${timeoutMs}ms`);
 }
 
-export async function setup() {
+export async function setup(project: TestProject) {
+  statePath = mkdtempSync(resolve(tmpdir(), 'threads-api-tests-'));
+  project.provide('wranglerStatePath', statePath);
+  const persistArgs = ['--persist-to', statePath];
   // Kill any stale wrangler process on the test port from a previous run
   try {
     execSync(`lsof -ti :${PORT} | xargs kill -9`, { stdio: 'pipe' });
@@ -66,12 +72,9 @@ export async function setup() {
     // No process on port — expected on clean runs
   }
 
-  // Clean any leftover local D1 data so we start fresh
-  rmSync(resolve(PROJECT_DIR, '.wrangler/state'), { recursive: true, force: true });
-
   // Apply all migrations to local D1 before starting the server. A single
   // Wrangler invocation is much faster in CI than shelling out once per file.
-  execFileSync('npx', ['wrangler', 'd1', 'migrations', 'apply', 'threads', '--local', '--config', 'wrangler.toml'], {
+  execFileSync('npx', ['wrangler', 'd1', 'migrations', 'apply', 'threads', '--local', '--config', 'wrangler.toml', ...persistArgs], {
     cwd: PROJECT_DIR,
     stdio: 'pipe',
     env: { ...process.env, CI: 'true' },
@@ -80,7 +83,7 @@ export async function setup() {
   // Seed the bootstrap admin the fixtures log in as: createTestUser() calls
   // POST /users, which requires an is_admin session (no server secret anymore).
   // helpers.ts logs in as this user and mints everything else over HTTP.
-  execFileSync('npx', ['wrangler', 'd1', 'execute', 'threads', '--local', '--config', 'wrangler.toml', '--command', await adminUpsertSql('__testadmin__', 'testpass123', 'Test Admin', '__testadmin__@example.com', true)], {
+  execFileSync('npx', ['wrangler', 'd1', 'execute', 'threads', '--local', '--config', 'wrangler.toml', ...persistArgs, '--command', await adminUpsertSql('__testadmin__', 'testpass123', 'Test Admin', '__testadmin__@example.com', true)], {
     cwd: PROJECT_DIR,
     stdio: 'pipe',
   });
@@ -92,6 +95,7 @@ export async function setup() {
     '--config', 'wrangler.toml',
     '--port', String(PORT),
     '--local',
+    ...persistArgs,
     '--test-scheduled',
     // Override wrangler.toml's ENVIRONMENT="production" so the server runs in
     // development mode for the test suite.
@@ -136,7 +140,11 @@ export async function setup() {
 export async function teardown() {
   const proc = wranglerProcess;
   wranglerProcess = undefined;
-  if (!proc) return;
+  if (!proc) {
+    if (statePath) rmSync(statePath, { recursive: true, force: true });
+    statePath = undefined;
+    return;
+  }
 
   if (proc.exitCode === null && proc.signalCode === null) {
     signalWranglerProcess(proc, 'SIGTERM');
@@ -149,4 +157,6 @@ export async function teardown() {
   }
 
   proc.stderr?.destroy();
+  if (statePath) rmSync(statePath, { recursive: true, force: true });
+  statePath = undefined;
 }
